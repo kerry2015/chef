@@ -52,7 +52,7 @@ class Chef
     class Deploy < Chef::Resource
       use_automatic_resource_name
 
-      identity_attr :repository
+      identity_attr :repo
 
       state_attrs :deploy_to, :revision
 

@@ -15,12 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+require 'chef/delayed_evaluator'
+
 class Chef
-  class DelayedEvaluator < Proc
-  end
   module Mixin
     module ParamsValidate
-
       # Takes a hash of options, along with a map to validate them.  Returns the original
       # options hash, plus any changes that might have been made (through things like setting
       # default values in the validation map)
@@ -239,4 +238,3 @@ class Chef
     end
   end
 end
-

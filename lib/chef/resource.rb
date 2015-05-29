@@ -34,6 +34,8 @@ require 'chef/platform'
 require 'chef/resource/resource_notification'
 require 'chef/provider_resolver'
 require 'chef/resource_resolver'
+require 'chef/resource/property_type'
+require 'chef/resource/implicit_property_type'
 
 require 'chef/mixin/deprecation'
 require 'chef/mixin/provides'
@@ -97,12 +99,12 @@ class Chef
     #
     # Create a new Resource.
     #
-    # @param name The name of this resource (corresponds to the #name attribute,
+    # @param name The name of this resource (corresponds to the #name property,
     #   used for notifications to this resource).
     # @param run_context The context of the Chef run. Corresponds to #run_context.
     #
     def initialize(name, run_context=nil)
-      name(name)
+      name(name) if name
       @run_context = run_context
       @noop = nil
       @before = nil
@@ -131,6 +133,199 @@ class Chef
     end
 
     #
+    # Properties
+    #
+
+    #
+    # Find out whether a property has been set on this resource or not.
+    #
+    # This will be true if:
+    # - The user explicitly set the value
+    # - The property has a default, and the value has been retrieved.
+    # - The property has name_property = true and name is set.
+    #
+    # From this point of view, it is worth looking at this as "what does the
+    # user think this value should be." In order words, if the user grabbed
+    # the value, even if it was a default, they probably based calculations on
+    # it. If they based calculations on it and the value changes, the rest of
+    # the world gets inconsistent.
+    #
+    # As far as name_property goes, the option name implies that it is more of
+    # an alias: when `name` is set, this property gets set as well.
+    #
+    # @param name [Symbol] The property name to check.
+    #
+    # @return [Boolean] Whether the property name has been set or not.
+    #
+    # @see Chef::Resource::PropertyType#is_set?
+    #
+    def property_is_set?(name)
+      name = name.to_sym
+      raise ArgumentError, "Property #{name} does not exist on #{self.class}" if !self.class.properties[name]
+      type = self.class.properties[name]
+      type.is_set?(self, name)
+    end
+
+    #
+    # Create a property on this resource class.
+    #
+    # If a superclass has this property, or if this property has already been
+    # defined by this resource, this will *override* the previous value.
+    #
+    # @param name [Symbol] The name of the property.
+    # @param type [Object,Array<Object>] The type(s) of this property.
+    #   If present, this is prepended to the `is` validation option.
+    # @param options [Hash<Symbol,Object>] Validation options.
+    #   @option options [Object,Array] :is An object, or list of
+    #     objects, that must match the value using Ruby's `===` operator
+    #     (`options[:is].any? { |v| v === value }`).
+    #   @option options [Object,Array] :equal_to An object, or list
+    #     of objects, that must be equal to the value using Ruby's `==`
+    #     operator (`options[:is].any? { |v| v == value }`)
+    #   @option options [Regexp,Array<Regexp>] :regex An object, or
+    #     list of objects, that must match the value with `regex.match(value)`.
+    #   @option options [Class,Array<Class>] :kind_of A class, or
+    #     list of classes, that the value must be an instance of.
+    #   @option options [Hash<String,Proc>] :callbacks A hash of
+    #     messages -> procs, all of which match the value. The proc must
+    #     return a truthy or falsey value (true means it matches).
+    #   @option options [Symbol,Array<Symbol>] :respond_to A method
+    #     name, or list of method names, the value must respond to.
+    #   @option options [Symbol,Array<Symbol>] :cannot_be A property,
+    #     or a list of properties, that the value cannot have (such as `:nil` or
+    #     `:empty`). The method with a questionmark at the end is called on the
+    #     value (e.g. `value.empty?`). If the value does not have this method,
+    #     it is considered valid (i.e. if you don't respond to `empty?` we
+    #     assume you are not empty).
+    #   @option options [Proc] :coerce A proc which will be called to
+    #     transform the user input to canonical form. The value is passed in,
+    #     and the transformed value returned as output. Lazy values will *not*
+    #     be passed to this method until after they are evaluated. Called in the
+    #     context of the resource (meaning you can access other properties).
+    #   @option options [Boolean] :required `true` if this property
+    #     must be present; `false` otherwise. This is checked after the resource
+    #     is fully initialized.
+    #   @option options [Boolean] :name_property `true` if this
+    #     property defaults to the same value as `name`. Equivalent to
+    #     `default: lazy { name }`, except that #property_is_set? will
+    #     return `true` if the property is set *or* if `name` is set.
+    #   @option options [Boolean] :name_attribute Same as `name_property`.
+    #   @option options [Object] :default The value this property
+    #     will return if the user does not set one. If this is `lazy`, it will
+    #     be run in the context of the instance (and able to access other
+    #     properties).
+    #   @option options [Boolean] :desired_state `true` if this property is
+    #     part of desired state. Defaults to `true`.
+    #   @option options [Boolean] :identity `true` if this property
+    #     is part of object identity. Defaults to `false`.
+    #   @option desired_state Whether this property is desired state or not.
+    #     Defaults to true.
+    #
+    # @return [Chef::Resource::PropertyType] The property type.
+    #
+    # @example With nothing
+    #   property :x
+    #
+    # @example With just a type
+    #   property :x, String
+    #
+    # @example With just options
+    #   property :x, default: 'hi'
+    #
+    # @example With type and options
+    #   property :x, String, default: 'hi'
+    #
+    def self.property(name, type=NULL_ARG, **options)
+      name = name.to_sym
+
+      # Handle name_attribute -> name_property
+      options[:name_property] ||= options.delete(:name_attribute) if options.has_key?(:name_attribute)
+
+      # Create the type that will drive the get/set
+      local_properties[name] = property_type(type, options)
+
+      # Make the getter and setter methods
+      #
+      # NOTE: We eval a string so that the name of the property will show up in
+      # the stack rather than "property"
+      class_eval <<-EOM, __FILE__, __LINE__+1
+        def #{name}(value=NULL_ARG)
+          if value == NULL_ARG
+            self.class.properties[#{name.inspect}].get(self, #{name.inspect})
+          elsif value.nil? && !self.class.properties[#{name.inspect}].explicitly_accepts_nil?(self, #{name.inspect})
+            # If you say "my_property nil" and the property explicitly accepts
+            # nil values, we consider this a get.
+            Chef::Log.deprecation("#{name} nil currently does not overwrite the value of #{name}. This will change in Chef 13, and the value will be set to nil instead. Please change your code to explicitly accept nil using \\"property :#{name}, [MyType, nil]\\", or stop setting this value to nil.")
+            self.class.properties[#{name.inspect}].get(self, #{name.inspect})
+          else
+            self.class.properties[#{name.inspect}].set(self, #{name.inspect}, value)
+          end
+        end
+        def #{name}=(value)
+          self.class.properties[#{name.inspect}].set(self, #{name.inspect}, value)
+        end
+      EOM
+    end
+
+    #
+    # Create a property type that can be attached to multiple properties.
+    #
+    # @param name [Symbol] The name of the property.
+    # @param type [Object,Array<Object>] The type(s) of this property.
+    #   If present, this is prepended to the `is` validation option.
+    # @param options [Hash<Symbol,Object>] Validation options.
+    #   See #property for a list of valid options.
+    #
+    # @return [Chef::Resource::PropertyType] The created property type
+    #
+    def self.property_type(type=NULL_ARG, **options)
+      return type if type.is_a?(PropertyType) && options.empty?
+
+      # Add type to options[:is]
+      if type != NULL_ARG
+        is = options[:is]
+
+        type = [ type ] if !type.is_a?(Array)
+        options[:is] = type
+        if is
+          is = [ is ] if !is.is_a?(Array)
+          options[:is] += is
+        end
+      end
+
+      PropertyType.new(options)
+    end
+
+    #
+    # The list of properties on this resource.
+    #
+    # Includes properties from the superclass.
+    #
+    # @return [Hash<Symbol,Chef::Resource::PropertyType>] A hash from property
+    #   name to property type.
+    #
+    def self.properties
+      if superclass.respond_to?(:properties)
+        superclass.properties.merge(local_properties)
+      else
+        local_properties
+      end
+    end
+
+    #
+    # The list of properties on this resource.
+    #
+    # Does *not* include properties from the superclass.
+    #
+    # @return [Hash<Symbol,Chef::Resource::PropertyType>] A hash from property
+    #   name to property type.
+    #
+    def self.local_properties
+      @local_properties ||= {}
+    end
+    class<<self; protected :local_properties; end
+
+    #
     # The name of this particular resource.
     #
     # This special resource attribute is set automatically from the declaration
@@ -153,16 +348,7 @@ class Chef
     # @param name [Object] The name to set, typically a String or Array
     # @return [String] The name of this Resource.
     #
-    def name(name=nil)
-      if !name.nil?
-        if name.is_a?(Array)
-          @name = name.join(', ')
-        else
-          @name = name.to_s
-        end
-      end
-      @name
-    end
+    property :name, String, coerce: proc { |name| name.is_a?(Array) ? name.join(', ') : name.to_s }, desired_state: false
 
     #
     # The action or actions that will be taken when this resource is run.
@@ -475,13 +661,18 @@ class Chef
     #
     # Get the value of the state attributes in this resource as a hash.
     #
+    # Does not include properties that are not set.
+    #
     # @return [Hash{Symbol => Object}] A Hash of attribute => value for the
     #   Resource class's `state_attrs`.
+    #
     def state_for_resource_reporter
-      self.class.state_attrs.inject({}) do |state_attrs, attr_name|
-        state_attrs[attr_name] = send(attr_name)
-        state_attrs
+      state = {}
+      self.class.state_attrs.each do |name|
+        next if self.class.properties[name] && !property_is_set?(name)
+        state[name] = send(name)
       end
+      state
     end
 
     #
@@ -494,17 +685,25 @@ class Chef
     alias_method :state, :state_for_resource_reporter
 
     #
-    # The value of the identity attribute, if declared. Falls back to #name if
-    # no identity attribute is declared.
+    # The value of the identity of this resource.
     #
-    # @return The value of the identity attribute.
+    # - If there are no identity properties on the resource, `name` is returned.
+    # - If there is exactly one identity property on the resource, it is returned.
+    # - If there are more than one, they are returned in a hash. Properties that
+    #   are not set are not included in the hash.
+    #
+    # @return [Object,Hash<Symbol,Object>] The identity of this resource.
     #
     def identity
-      if identity_attr = self.class.identity_attr
-        send(identity_attr)
-      else
-        name
+      identity_properties = self.class.properties.select { |name,type| type.identity? }
+      identity_properties = { name: self.class.properties[:name] } if identity_properties.empty?
+
+      result = {}
+      identity_properties.each do |name, type|
+        result[name] = send(name) if property_is_set?(name)
       end
+      return result.values.first if identity_properties.size == 1
+      result
     end
 
     #
@@ -703,6 +902,7 @@ class Chef
       provider(arg)
     end
 
+    #
     # Set or return the list of "state attributes" implemented by the Resource
     # subclass. State attributes are attributes that describe the desired state
     # of the system, such as file permissions or ownership. In general, state
@@ -715,35 +915,74 @@ class Chef
     #
     # This list is used by the Chef client auditing system to extract
     # information from resources to describe changes made to the system.
+    #
+    # @deprecated This is not deprecated, but it is no longer preferred:
+    # you should use the `desired_state` option to Chef::Resource.property
+    # to denote non-shared state instead:
+    #
+    # ```ruby
+    # property :x, desired_state: false
+    # ```
+    #
     def self.state_attrs(*attr_names)
-      @state_attrs ||= []
-      @state_attrs = attr_names unless attr_names.empty?
+      if !attr_names.empty?
+        attr_names = attr_names.map { |name| name.to_sym }
 
-      # Return *all* state_attrs that this class has, including inherited ones
-      if superclass.respond_to?(:state_attrs)
-        superclass.state_attrs + @state_attrs
-      else
-        @state_attrs
+        # attr_names *always* includes superclass.attr_names
+        attr_names -= superclass.attr_names if superclass.respond_to?(:attr_names)
+
+        # Add new properties to the list.
+        attr_names.each do |name|
+          local_properties[name] ||= ImplicitPropertyType.new
+        end
+
+        # If state_attrs *excludes* something which is currently desired state,
+        # mark it as not desired state.
+        local_properties.each do |name,type|
+          if type.desired_state? && !attr_names.include?(name)
+            local_properties[name] = type.specialize(desired_state: false)
+          end
+        end
       end
+
+      # Grab properties representing desired state
+      properties.select { |name,type| type.desired_state? }.map { |name,type| name }
     end
 
-    # Set or return the "identity attribute" for this resource class. This is
-    # generally going to be the "name attribute" for this resource. In other
-    # words, the resource type plus this attribute uniquely identify a given
-    # bit of state that chef manages. For a File resource, this would be the
-    # path, for a package resource, it will be the package name. This will show
-    # up in chef-client's audit records as a searchable field.
-    def self.identity_attr(attr_name=nil)
-      @identity_attr ||= nil
-      @identity_attr = attr_name if attr_name
-
-      # If this class doesn't have an identity attr, we'll defer to the superclass:
-      if @identity_attr || !superclass.respond_to?(:identity_attr)
-        @identity_attr
-      else
-        superclass.identity_attr
+    #
+    # Set a property as the "identity attribute" for this resource.
+    #
+    # Unsets "identity attribute" on all other property.
+    #
+    # @param name [Symbol]
+    #
+    # @return [Symbol]
+    #
+    # @deprecated This is no longer the preferred way of doing this: instead,
+    #   pass identity: true to `Chef::Resource.property`.
+    #
+    def self.identity_attr(name=nil)
+      if name
+        name = name.to_sym
+        # Switch off
+        properties.each do |prop_name,type|
+          if type.identity? && prop_name != name
+            local_properties[prop_name] = type.specialize(identity: false)
+          end
+        end
+        # Grab the existing type, and specialize it if it exists.
+        type = properties[name]
+        if type
+          type = type.specialize(identity: true)
+        else
+          type = ImplicitPropertyType.new(identity: true)
+        end
+        local_properties[name] = type
       end
+
+      properties.select { |name,type| type.identity? }.map { |name,type| name }.first || :name
     end
+
 
     #
     # The guard interpreter that will be used to process `only_if` and `not_if`
